@@ -78,21 +78,39 @@ namespace stone
         uint32_t sn;       // sequence number
         uint32_t una;      // unacknowledged sequence number
         uint32_t len;      // data length
-        uint32_t resendts; // resend timestamp
-        uint32_t rto;      // retransmission timeout
-        uint32_t fastack;  // fast retransmit
-        uint32_t xmit;     // transmit times
     };
+
+
+    class KcpMsg
+    {
+    public:
+        KcpMsg();
+        KcpMsg(int size);
+        KcpMsg(const KcpMsg &msg)=delete;
+        KcpMsg &operator=(const KcpMsg &msg)=delete;
+        KcpMsg(KcpMsg &&msg)=delete;
+        KcpMsg &operator=(KcpMsg &&msg)=delete;
+        ~KcpMsg();
+
+        void parse_header(const char *data);
+        kcpHeader &header();
+        char *data();
+
+    private: 
+        kcpHeader header_;
+        char *data_;
+    };
+   
 
     class kcpSeg
     {
     public:
         kcpSeg();
         kcpSeg(int size);
-        kcpSeg(const kcpSeg &seg);
-        kcpSeg &operator=(const kcpSeg &seg);
-        kcpSeg(kcpSeg &&seg);
-        kcpSeg &operator=(kcpSeg &&seg);
+        kcpSeg(const kcpSeg &seg)=delete;
+        kcpSeg &operator=(const kcpSeg &seg)=delete;
+        kcpSeg(kcpSeg &&seg)=delete;
+        kcpSeg &operator=(kcpSeg &&seg)=delete;
         ~kcpSeg();
 
         void parse_header(const char *data);
@@ -103,9 +121,14 @@ namespace stone
         int size();
         void set_data(const char *buf, int len);
 
-        kcpHeader header_;
-        char *data; //
+        uint32_t resendts; // resend timestamp
+        uint32_t rto;      // retransmission timeout
+        uint32_t fastack;  // fast retransmit
+        uint32_t xmit;     // transmit times
+        KcpMsg msg_;
     };
+
+
 
     class Kcpp;
     using outputCallBack = std::function<int(const char *buf, int len, Kcpp *kcp, void *user)>;

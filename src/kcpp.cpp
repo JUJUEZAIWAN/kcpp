@@ -1,5 +1,6 @@
 #include "kcpp.h"
 
+#include <limits>
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -11,48 +12,37 @@ static inline long _itimediff(uint32_t later, uint32_t earlier)
     return static_cast<long>(later) - static_cast<long>(earlier);
 }
 
-kcpSeg::kcpSeg() : data(nullptr)
+KcpMsg::KcpMsg() : data_(nullptr)
 {
-    memset(&header_, 0, sizeof(kcpHeader));
+    memset(&header_, 0, sizeof(header_));
+}
+KcpMsg::KcpMsg(int size) : data_(new char[size])
+{
+    memset(&header_, 0, sizeof(header_));
 }
 
-kcpSeg::kcpSeg(int size)
-    : data(new char[size])
+KcpMsg::KcpMsg(KcpMsg &&msg)
 {
-    memset(&header_, 0, sizeof(kcpHeader));
+    data_ = msg.data_;
+    msg.data_ = nullptr;
+    memcpy(&header_, &msg.header(), sizeof(kcpHeader));
 }
-
-kcpSeg::~kcpSeg()
+KcpMsg &KcpMsg::operator=(KcpMsg &&msg)
 {
-    delete[] data;
-}
-
-kcpSeg::kcpSeg(const kcpSeg &seg)
-{
-    header_ = seg.header_;
-    data = new char[seg.header_.len];
-}
-kcpSeg &kcpSeg::operator=(const kcpSeg &seg)
-{
-    header_ = seg.header_;
-    data = new char[seg.header_.len];
+    data_ = msg.data_;
+    msg.data_ = nullptr;
+    memcpy(&header_, &msg.header(), sizeof(kcpHeader));
     return *this;
 }
-kcpSeg::kcpSeg(kcpSeg &&seg)
+KcpMsg::~KcpMsg()
 {
-    header_ = seg.header_;
-    data = seg.data;
-    seg.data = nullptr;
-}
-kcpSeg &kcpSeg::operator=(kcpSeg &&seg)
-{
-    header_ = seg.header_;
-    data = seg.data;
-    seg.data = nullptr;
-    return *this;
+    if (data_ != nullptr)
+    {
+        delete[] data_;
+    }
 }
 
-void kcpSeg::parse_header(const char *data)
+void KcpMsg::parse_header(const char *data)
 {
     memcpy(&header_, data, KCP_OVERHEAD);
 #if IWORDS_BIG_ENDIAN || IWORDS_MUST_ALIGN
@@ -66,27 +56,53 @@ void kcpSeg::parse_header(const char *data)
     header_.len = ntohl(header_.len);
 #endif
 }
+kcpHeader &KcpMsg::header()
+{
+    return header_;
+}
+char *KcpMsg::data()
+{
+    return data_;
+}
+
+kcpSeg::kcpSeg() : kcpSeg(0)
+{
+}
+
+kcpSeg::kcpSeg(int size) : resendts(0), rto(0), fastack(0), xmit(0), msg_(size)
+{
+}
+
+kcpSeg::~kcpSeg()
+{
+    // nothing to do
+}
+
+void kcpSeg::parse_header(const char *data)
+{
+    msg_.parse_header(data);
+}
 
 char *kcpSeg::copy_header2buf(char *buf)
 {
-    memcpy(buf, &header_, KCP_OVERHEAD); // don't use sizeof(kcpHeader) here
+    memcpy(buf, &msg_.header(), KCP_OVERHEAD);
     return buf + KCP_OVERHEAD;
 }
 
 char *kcpSeg::copy_data2buf(char *buf)
 {
-    memcpy(buf, data, header_.len);
-    return buf + header_.len;
+    memcpy(buf, msg_.data(), msg_.header().len);
+    return buf + msg_.header().len;
 }
 
 int kcpSeg::size()
 {
-    return sizeof(kcpHeader) + header_.len;
+    return sizeof(kcpHeader) + msg_.header().len;
 }
 
 void kcpSeg::set_data(const char *buf, int len)
 {
-    memcpy(data, buf, len);
+    memcpy(msg_.data(), buf, len);
 }
 
 Kcpp::Kcpp(uint32_t conv, void *user)
@@ -207,24 +223,24 @@ int Kcpp::send(const char *data, int len)
         {
             auto &old = send_queue_.front();
 
-            if (old->header_.len < mss_)
+            if (old->msg_.header().len < mss_)
             {
-                int capacity = mss_ - old->header_.len;
+                int capacity = mss_ - old->msg_.header().len;
                 int extend = std::min(len, capacity);
 
-                kcpSegPtr seg = std::make_unique<kcpSeg>(old->header_.len + extend);
+                kcpSegPtr seg = std::make_unique<kcpSeg>(old->msg_.header().len + extend);
 
-                memcpy(seg->data, old->data, old->header_.len);
-                old->copy_data2buf(seg->data);
+                memcpy(seg->msg_.data(), old->msg_.data(), old->msg_.header().len);
+                old->copy_data2buf(seg->msg_.data());
 
                 if (data)
                 {
-                    memcpy(seg->data + old->header_.len, data, extend);
+                    memcpy(seg->msg_.data() + old->msg_.header().len, data, extend);
                     data += extend;
                 }
 
-                seg->header_.len = old->header_.len + extend;
-                seg->header_.frg = 0;
+                seg->msg_.header().len = old->msg_.header().len + extend;
+                seg->msg_.header().frg = 0;
                 len -= extend;
                 send_queue_.push_back(std::move(seg));
                 send_queue_.pop_front();
@@ -260,8 +276,8 @@ int Kcpp::send(const char *data, int len)
             seg->set_data(data, size);
         }
 
-        seg->header_.len = size;
-        seg->header_.frg = stream_ ? 0 : (count - i - 1);
+        seg->msg_.header().len = size;
+        seg->msg_.header().frg = stream_ ? 0 : (count - i - 1);
 
         send_queue_.push_back(std::move(seg));
         if (data)
@@ -308,16 +324,15 @@ int Kcpp::recv(char *buffer, int len)
 
     for (auto it = rcv_queue_.begin(); it != rcv_queue_.end();)
     {
-        int fragment = (*it)->header_.frg;
+        int fragment = (*it)->msg_.header().frg;
         buffer = (*it)->copy_data2buf(buffer);
-        len += (*it)->header_.len;
+        len += (*it)->msg_.header().len;
 
         it = rcv_queue_.erase(it);
 
         if (fragment == 0)
             break;
     }
-
 
     // move available data from rcv_buf -> rcv_queue
     mv_buf_to_queue();
@@ -385,7 +400,7 @@ int32_t Kcpp::check(uint32_t current)
 
     for (auto &seg : send_buf_)
     {
-        int diff = _itimediff(seg->header_.resendts, current);
+        int diff = _itimediff(seg->resendts, current);
         if (diff <= 0)
         {
             return current;
@@ -474,12 +489,12 @@ int Kcpp::peek_size()
 
     auto &seg = rcv_queue_.front();
 
-    if (seg->header_.frg == 0) // only one segment
+    if (seg->msg_.header().frg == 0) // only one segment
     {
-        return seg->header_.len;
+        return seg->msg_.header().len;
     }
 
-    if (rcv_queue_.size() < seg->header_.frg + 1) // no enough segments
+    if (rcv_queue_.size() < seg->msg_.header().frg + 1) // no enough segments
     {
         return -1;
     }
@@ -487,8 +502,8 @@ int Kcpp::peek_size()
     int length = 0;
     for (auto &seg : rcv_queue_) // calculate length
     {
-        length += seg->header_.len;
-        if (seg->header_.frg == 0) // last segment
+        length += seg->msg_.header().len;
+        if (seg->msg_.header().frg == 0) // last segment
         {
             break;
         }
@@ -504,16 +519,16 @@ void Kcpp::parse_fastack(uint32_t sn, uint32_t ts)
 
     for (auto &seg : send_buf_)
     {
-        if (sn != seg->header_.sn)
+        if (sn != seg->msg_.header().sn)
         {
 #ifndef KCP_FASTACK_CONSERVE
-            seg->header_.fastack++;
+            seg->fastack++;
 #else
             if (ts >= seg->ts)
-                seg->header_.fastack++;
+                seg->msg_.header().fastack++;
 #endif
         }
-        else if (sn < seg->header_.sn)
+        else if (sn < seg->msg_.header().sn)
         {
             break;
         }
@@ -557,12 +572,12 @@ void Kcpp::remove_ack(uint32_t sn)
     for (auto it = send_buf_.begin(); it != send_buf_.end(); ++it)
     {
         auto &seg = *it;
-        if (sn == seg->header_.sn) // find the segment and remove it
+        if (sn == seg->msg_.header().sn) // find the segment and remove it
         {
             send_buf_.erase(it);
             break;
         }
-        if (sn < seg->header_.sn) // the  segment of sn is not exist
+        if (sn < seg->msg_.header().sn) // the  segment of sn is not exist
         {
             break;
         }
@@ -572,7 +587,7 @@ void Kcpp::remove_ack(uint32_t sn)
 // check if the data is repeat, if repeat throw it away , else put it into rcv_buf
 void Kcpp::check_data_repeat(kcpSegPtr newseg)
 {
-    uint32_t sn = newseg->header_.sn;
+    uint32_t sn = newseg->msg_.header().sn;
     bool repeat_flag = false;
 
     if (sn >= rcv_nxt_ + rcv_wnd_ || sn < rcv_nxt_) // out of window
@@ -582,12 +597,12 @@ void Kcpp::check_data_repeat(kcpSegPtr newseg)
 
     for (auto &seg : rcv_buf_)
     {
-        if (sn == seg->header_.sn) // repeat
+        if (sn == seg->msg_.header().sn) // repeat
         {
             repeat_flag = true;
             break;
         }
-        if (sn < seg->header_.sn) // out of order
+        if (sn < seg->msg_.header().sn) // out of order
         {
             break;
         }
@@ -608,7 +623,7 @@ void Kcpp::remove_before_una(uint32_t una)
     auto it = send_buf_.begin();
     while (it != send_buf_.end())
     {
-        if (una > (*it)->header_.sn)
+        if (una > (*it)->msg_.header().sn)
         {
             it = send_buf_.erase(it);
         }
@@ -622,7 +637,7 @@ void Kcpp::remove_before_una(uint32_t una)
 // if snd_buf is empty, reset snd_una and snd_nxt
 void Kcpp::shrink_buf()
 {
-    snd_una_ = send_buf_.empty() ? snd_nxt_ : send_buf_.front()->header_.sn;
+    snd_una_ = send_buf_.empty() ? snd_nxt_ : send_buf_.front()->msg_.header().sn;
 }
 
 // get data from UDP
@@ -648,89 +663,89 @@ int Kcpp::input(const char *data, uint32_t size)
         data += KCP_OVERHEAD;
         size -= KCP_OVERHEAD;
 
-        if (segment.header_.conv != conv_) // conv is not match
+        if (segment.msg_.header().conv != conv_) // conv is not match
         {
             return -1;
         }
-        else if (size < static_cast<int>(segment.header_.len)) // data is imcomplete
+        else if (size < static_cast<int>(segment.msg_.header().len)) // data is imcomplete
         {
             return -1;
         }
 
-        if (size < segment.header_.len)
+        if (size < segment.msg_.header().len)
         {
             return -2;
         }
-        if (static_cast<long>(segment.header_.len) < 0 || static_cast<long>(size) < static_cast<long>(segment.header_.len))
+        if (static_cast<long>(segment.msg_.header().len) < 0 || static_cast<long>(size) < static_cast<long>(segment.msg_.header().len))
         {
             return -2;
         }
 
-        if (segment.header_.cmd != KCP_CMD_PUSH && segment.header_.cmd != KCP_CMD_ACK &&
-            segment.header_.cmd != KCP_CMD_WASK && segment.header_.cmd != KCP_CMD_WINS)
+        if (segment.msg_.header().cmd != KCP_CMD_PUSH && segment.msg_.header().cmd != KCP_CMD_ACK &&
+            segment.msg_.header().cmd != KCP_CMD_WASK && segment.msg_.header().cmd != KCP_CMD_WINS)
             return -3;
 
-        rmt_wnd_ = segment.header_.wnd;
-        remove_before_una(segment.header_.una);
+        rmt_wnd_ = segment.msg_.header().wnd;
+        remove_before_una(segment.msg_.header().una);
         shrink_buf();
 
-        if (segment.header_.cmd == KCP_CMD_ACK) // ACK
+        if (segment.msg_.header().cmd == KCP_CMD_ACK) // ACK
         {
-            if (current_ >= segment.header_.ts)
+            if (current_ >= segment.msg_.header().ts)
             {
-                update_ack(static_cast<int>(current_ - segment.header_.ts));
+                update_ack(static_cast<int>(current_ - segment.msg_.header().ts));
             }
-            remove_ack(segment.header_.sn);
+            remove_ack(segment.msg_.header().sn);
             shrink_buf();
             if (!flag)
             {
                 flag = true;
-                maxack = segment.header_.sn;
-                latest_ts = segment.header_.ts;
+                maxack = segment.msg_.header().sn;
+                latest_ts = segment.msg_.header().ts;
             }
             else
             {
-                if (segment.header_.sn > maxack)
+                if (segment.msg_.header().sn > maxack)
                 {
-                    maxack = segment.header_.sn;
-                    latest_ts = segment.header_.ts;
+                    maxack = segment.msg_.header().sn;
+                    latest_ts = segment.msg_.header().ts;
                 }
             }
             // log here
         }
-        else if (segment.header_.cmd == KCP_CMD_PUSH) // PUSH
+        else if (segment.msg_.header().cmd == KCP_CMD_PUSH) // PUSH
         {
             // log here
-            if (_itimediff(segment.header_.sn, rcv_nxt_ + rcv_wnd_) < 0)
+            if (_itimediff(segment.msg_.header().sn, rcv_nxt_ + rcv_wnd_) < 0)
             {
-                acklist_.push_back({segment.header_.sn, segment.header_.ts});
+                acklist_.push_back({segment.msg_.header().sn, segment.msg_.header().ts});
 
-                if (segment.header_.sn >= rcv_nxt_)
+                if (segment.msg_.header().sn >= rcv_nxt_)
                 {
                     kcpSegPtr seg = std::make_unique<kcpSeg>(segment);
 
-                    if (segment.header_.len > 0)
+                    if (segment.msg_.header().len > 0)
                     {
-                        memcpy(seg->data, data, segment.header_.len);
+                        memcpy(seg->msg_.data(), data, segment.msg_.header().len);
                     }
                     check_data_repeat(std::move(seg));
                 }
             }
         }
-        else if (segment.header_.cmd == KCP_CMD_WASK)
+        else if (segment.msg_.header().cmd == KCP_CMD_WASK)
         {
             // ready to send back KCP_CMD_WINS in KCP_flush
             // tell remote my window size
             probe_ |= KCP_ASK_SEND;
             // log here
         }
-        else if (segment.header_.cmd == KCP_CMD_WINS)
+        else if (segment.msg_.header().cmd == KCP_CMD_WINS)
         {
             // do nothing
         }
 
-        data += segment.header_.len;
-        size -= segment.header_.len;
+        data += segment.msg_.header().len;
+        size -= segment.msg_.header().len;
     }
 
     if (flag)
@@ -783,7 +798,7 @@ void Kcpp::mv_buf_to_queue()
     while (!rcv_buf_.empty())
     {
         auto &seg = rcv_buf_.front();
-        if (seg->header_.sn == rcv_nxt_ && rcv_queue_.size() < rcv_wnd_)
+        if (seg->msg_.header().sn == rcv_nxt_ && rcv_queue_.size() < rcv_wnd_)
         {
             rcv_queue_.push_back(std::move(seg));
             rcv_buf_.pop_front();
@@ -807,14 +822,14 @@ void Kcpp::mv_queue_to_buf()
     while (snd_nxt_ < snd_una_ + cwnd && !send_queue_.empty())
     {
         auto &newseg = send_queue_.front();
-        newseg->header_.conv = conv_;
-        newseg->header_.cmd = KCP_CMD_PUSH;
-        newseg->header_.wnd = wnd_unused();
-        newseg->header_.ts = current_;
-        newseg->header_.sn = snd_nxt_++;
-        newseg->header_.una = rcv_nxt_;
-        newseg->header_.resendts = current_;
-        newseg->header_.rto = rx_rto_;
+        newseg->msg_.header().conv = conv_;
+        newseg->msg_.header().cmd = KCP_CMD_PUSH;
+        newseg->msg_.header().wnd = wnd_unused();
+        newseg->msg_.header().ts = current_;
+        newseg->msg_.header().sn = snd_nxt_++;
+        newseg->msg_.header().una = rcv_nxt_;
+        newseg->resendts = current_;
+        newseg->rto = rx_rto_;
 
         send_buf_.push_back(std::move(newseg)); // move the data from snd_queue_ to snd_buf_
         send_queue_.pop_front();
@@ -827,17 +842,17 @@ void Kcpp::flush_ack()
     char *ptr = buffer_;
     kcpSeg seg;
 
-    seg.header_.conv = conv_;
-    seg.header_.cmd = KCP_CMD_ACK;
-    seg.header_.wnd = wnd_unused();
-    seg.header_.una = rcv_nxt_;
+    seg.msg_.header().conv = conv_;
+    seg.msg_.header().cmd = KCP_CMD_ACK;
+    seg.msg_.header().wnd = wnd_unused();
+    seg.msg_.header().una = rcv_nxt_;
 
     // flush acknowledges
     for (auto &ack : acklist_)
     {
         ptr = try_output(ptr);
-        seg.header_.sn = ack[0];
-        seg.header_.ts = ack[1];
+        seg.msg_.header().sn = ack[0];
+        seg.msg_.header().ts = ack[1];
         ptr = seg.copy_header2buf(ptr);
     }
     acklist_.clear();
@@ -860,15 +875,15 @@ void Kcpp::flush_window_probe()
     char *ptr = buffer_;
     kcpSeg seg;
 
-    seg.header_.conv = conv_;
-    seg.header_.cmd = KCP_CMD_ACK;
-    seg.header_.wnd = wnd_unused();
-    seg.header_.una = rcv_nxt_;
+    seg.msg_.header().conv = conv_;
+    seg.msg_.header().cmd = KCP_CMD_ACK;
+    seg.msg_.header().wnd = wnd_unused();
+    seg.msg_.header().una = rcv_nxt_;
 
     // flush window probing commands
     if (probe_ & KCP_ASK_SEND)
     {
-        seg.header_.cmd = KCP_CMD_WASK;
+        seg.msg_.header().cmd = KCP_CMD_WASK;
         ptr = try_output(ptr);
         ptr = seg.copy_header2buf(ptr);
     }
@@ -876,7 +891,7 @@ void Kcpp::flush_window_probe()
     // flush window probing commands
     if (probe_ & KCP_ASK_TELL)
     {
-        seg.header_.cmd = KCP_CMD_WINS;
+        seg.msg_.header().cmd = KCP_CMD_WINS;
         ptr = try_output(ptr);
         ptr = seg.copy_header2buf(ptr);
     }
@@ -893,10 +908,10 @@ void Kcpp::flush_data()
     char *ptr = buffer_;
 
     kcpSeg seg;
-    seg.header_.conv = conv_;
-    seg.header_.cmd = KCP_CMD_ACK;
-    seg.header_.wnd = wnd_unused();
-    seg.header_.una = rcv_nxt_;
+    seg.msg_.header().conv = conv_;
+    seg.msg_.header().cmd = KCP_CMD_ACK;
+    seg.msg_.header().wnd = wnd_unused();
+    seg.msg_.header().una = rcv_nxt_;
 
     uint32_t resent = (fastresend_ > 0) ? static_cast<uint32_t>(fastresend_) : std::numeric_limits<uint32_t>::max();
     uint32_t rtomin = (nodelay_ == 0) ? (rx_rto_ >> 3) : 0;
@@ -904,50 +919,50 @@ void Kcpp::flush_data()
     for (auto &segment : send_buf_)
     {
         bool needsend = false;
-        if (segment->header_.xmit == 0) // first time to send
+        if (segment->xmit == 0) // first time to send
         {
             needsend = true;
-            segment->header_.xmit++;
-            segment->header_.rto = rx_rto_;
-            segment->header_.resendts = current_ + segment->header_.rto + rtomin; // resend time
+            segment->xmit++;
+            segment->rto = rx_rto_;
+            segment->resendts = current_ + segment->rto + rtomin; // resend time
         }
-        else if (current_ >= segment->header_.resendts) // resend
+        else if (current_ >= segment->resendts) // resend
         {
             needsend = true;
-            segment->header_.xmit++;
+            segment->xmit++;
             xmit_++;
             if (nodelay_ == 0)
             {
-                segment->header_.rto += std::max(segment->header_.rto, static_cast<uint32_t>(rx_rto_));
+                segment->rto += std::max(segment->rto, static_cast<uint32_t>(rx_rto_));
             }
             else
             {
-                segment->header_.rto += rx_rto_;
+                segment->rto += rx_rto_;
             }
-            segment->header_.resendts = current_ + segment->header_.rto;
+            segment->resendts = current_ + segment->rto;
             lost = true; // lost
         }
-        else if (segment->header_.fastack >= resent) // fast resend
+        else if (segment->fastack >= resent) // fast resend
         {
             needsend = true;
-            segment->header_.xmit++;
-            segment->header_.fastack = 0;
-            segment->header_.resendts = current_ + segment->header_.rto;
+            segment->xmit++;
+            segment->fastack = 0;
+            segment->resendts = current_ + segment->rto;
             change = true;
         }
 
         if (needsend)
         {
-            segment->header_.ts = current_;
-            segment->header_.wnd = seg.header_.wnd;
-            segment->header_.una = rcv_nxt_;
+            segment->msg_.header().ts = current_;
+            segment->msg_.header().wnd = seg.msg_.header().wnd;
+            segment->msg_.header().una = rcv_nxt_;
 
             ptr = try_output(ptr);
 
             ptr = segment->copy_header2buf(ptr);
             ptr = segment->copy_data2buf(ptr);
 
-            if (segment->header_.xmit >= dead_link_)
+            if (segment->xmit >= dead_link_)
             {
                 state_ = false;
             }
